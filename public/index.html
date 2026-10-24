@@ -1,0 +1,590 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>The Old Cartographer</title>
+<style>
+  :root { --amber:#e9b46a; --ink:#f3e9d8; --bg:#0b0907; }
+  html,body { margin:0; height:100%; background:var(--bg); color:var(--ink); font-family: Georgia, "Times New Roman", serif; overflow:hidden; }
+  canvas { display:block; touch-action:none; }
+  #overlay { position:fixed; inset:0; display:flex; align-items:center; justify-content:center; background:radial-gradient(ellipse at center,#1d1610 0%,#050403 75%); z-index:10; }
+  .card { max-width:440px; padding:28px 24px; text-align:center; }
+  h1 { font-weight:normal; letter-spacing:.06em; margin:0 0 6px; color:var(--amber); }
+  .sub { opacity:.75; margin:0 0 22px; line-height:1.5; }
+  input { font:inherit; padding:10px 12px; border-radius:6px; border:1px solid #5a4630; background:#140f0a; color:var(--ink); width:100%; box-sizing:border-box; }
+  button { font:inherit; padding:12px 20px; border-radius:6px; border:1px solid var(--amber); background:#2a1d10; color:var(--ink); cursor:pointer; }
+  button:hover { background:#3a2815; }
+  #startBtn { margin-top:14px; width:100%; font-size:1.1em; }
+  #passWrap { display:none; margin-bottom:6px; }
+  #cfgNote { font-size:.85em; opacity:.6; margin-top:14px; line-height:1.4; }
+  #hud { position:fixed; left:0; right:0; bottom:0; display:none; gap:8px; padding:12px 16px; background:linear-gradient(transparent,#000a 40%); z-index:5; }
+  #hud .row { display:flex; gap:8px; max-width:720px; margin:0 auto; }
+  #talkBtn { white-space:nowrap; user-select:none; -webkit-user-select:none; }
+  #talkBtn.on { background:#7a2d16; border-color:#ff9a6a; }
+  #debug { position:fixed; top:10px; left:10px; font:12px monospace; background:#000a; padding:6px 8px; border-radius:4px; display:none; z-index:6; }
+  #hint { position:fixed; top:10px; right:12px; font-size:12px; opacity:.5; z-index:6; display:none; text-align:right; }
+  #VRButton { z-index:7 !important; }
+</style>
+</head>
+<body>
+<div id="overlay">
+  <div class="card">
+    <h1>The Old Cartographer</h1>
+    <p class="sub">You've been thrown into a cell. Someone is already in it.<br>Speak to him. Choose your words.</p>
+    <div id="passWrap"><input id="pass" type="password" placeholder="Passcode" autocomplete="off"></div>
+    <button id="startBtn" disabled>Loading…</button>
+    <div id="cfgNote"></div>
+  </div>
+</div>
+<div id="hud"><div class="row">
+  <button id="talkBtn">Hold to speak</button>
+  <input id="say" placeholder="…or type and press Enter" autocomplete="off">
+</div></div>
+<div id="debug"></div>
+<div id="hint">Drag to look · Hold Space to speak · T for trust</div>
+
+<script type="importmap">
+{ "imports": {
+  "three": "https://cdn.jsdelivr.net/npm/three@0.170.0/build/three.module.js",
+  "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.170.0/examples/jsm/"
+} }
+</script>
+<script type="module">
+import * as THREE from "three";
+import { VRButton } from "three/addons/webxr/VRButton.js";
+
+// ================= State =================
+const INTRO = "Another one. Wonderful. Keep to your side, and keep quiet.";
+const FAREWELL = "Go on, then. Don't look back. And mind the bell.";
+const state = {
+  cfg: { ready:false, stt:false, tts:false, needsPasscode:false },
+  pass: "",
+  trust: 0,
+  history: [
+    { role:"user", content:"(The cell door slams shut behind me. I'm alone with you.)" },
+    { role:"assistant", content: INTRO },
+  ],
+  busy: false,        // waiting on the server
+  speaking: false,
+  recording: false,
+  revealed: false,
+  escaped: false,
+};
+const store = { get(k){ try { return localStorage.getItem(k); } catch { return null; } },
+                set(k,v){ try { localStorage.setItem(k,v); } catch {} } };
+
+// ================= Server =================
+async function api(action, body) {
+  const r = await fetch(`/api/${action}`, {
+    method: body ? "POST" : "GET",
+    headers: { "content-type":"application/json", "x-game-pass": state.pass },
+    body: body ? JSON.stringify(body) : undefined,
+  });
+  const data = await r.json().catch(() => ({ error:`Server returned ${r.status}` }));
+  if (!r.ok || data.error) throw new Error(data.error || `Error ${r.status}`);
+  return data;
+}
+
+// ================= Renderer & scene =================
+const renderer = new THREE.WebGLRenderer({ antialias:true });
+renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+renderer.setSize(innerWidth, innerHeight);
+renderer.outputColorSpace = THREE.SRGBColorSpace;
+renderer.toneMapping = THREE.ACESFilmicToneMapping;
+renderer.toneMappingExposure = 1.1;
+renderer.xr.enabled = true;
+renderer.xr.setReferenceSpaceType("local-floor");
+document.body.appendChild(renderer.domElement);
+
+const scene = new THREE.Scene();
+scene.background = new THREE.Color(0x050403);
+scene.fog = new THREE.Fog(0x050403, 4, 9);
+
+const camera = new THREE.PerspectiveCamera(70, innerWidth/innerHeight, 0.05, 50);
+camera.position.set(0, 1.6, 0.4);
+scene.add(camera);
+
+// ---------- Procedural textures ----------
+function rand(seed) { let s = seed; return () => (s = (s * 16807) % 2147483647) / 2147483647; }
+function stoneCanvas({ size=512, rows=8, cols=4, base=[92,84,74], mortar="#1b1713", seed=7, crescent=false }) {
+  const c = document.createElement("canvas"); c.width = c.height = size;
+  const g = c.getContext("2d"), r = rand(seed);
+  g.fillStyle = mortar; g.fillRect(0,0,size,size);
+  const bh = size/rows, bw = size/cols;
+  for (let y=0; y<rows; y++) {
+    const off = (y%2) * bw/2;
+    for (let x=-1; x<=cols; x++) {
+      const v = 0.7 + r()*0.45;
+      g.fillStyle = `rgb(${base[0]*v|0},${base[1]*v|0},${base[2]*v|0})`;
+      const px = x*bw + off + 3, py = y*bh + 3;
+      g.fillRect(px, py, bw-6, bh-6);
+      for (let i=0; i<60; i++) {   // speckle
+        const s = 0.6 + r()*0.6;
+        g.fillStyle = `rgba(${r()<.5?0:255},${r()<.5?0:255},${r()<.5?0:255},${0.04*s})`;
+        g.fillRect(px + r()*(bw-6), py + r()*(bh-6), 2+r()*5, 2+r()*5);
+      }
+    }
+  }
+  if (crescent) {
+    g.strokeStyle = "rgba(20,15,10,.85)"; g.lineWidth = size*0.035; g.lineCap = "round";
+    g.beginPath(); g.arc(size*0.5, size*0.5, size*0.22, Math.PI*0.25, Math.PI*1.25); g.stroke();
+    g.beginPath(); g.arc(size*0.43, size*0.43, size*0.16, Math.PI*0.25, Math.PI*1.25); g.stroke();
+  }
+  return c;
+}
+function tex(canvas, rx=1, ry=1) {
+  const t = new THREE.CanvasTexture(canvas);
+  t.wrapS = t.wrapT = THREE.RepeatWrapping; t.repeat.set(rx, ry);
+  t.colorSpace = THREE.SRGBColorSpace; t.anisotropy = 4;
+  return t;
+}
+const wallMat  = new THREE.MeshStandardMaterial({ map: tex(stoneCanvas({ seed:3 }), 3.5, 2.6), roughness:.95 });
+const floorMat = new THREE.MeshStandardMaterial({ map: tex(stoneCanvas({ rows:4, cols:4, base:[70,64,58], seed:11 }), 3, 3), roughness:1 });
+const ceilMat  = new THREE.MeshStandardMaterial({ map: tex(stoneCanvas({ base:[50,46,42], seed:19 }), 3, 3), roughness:1 });
+
+// ---------- Cell (x: -2..2, z: -3..1.4, y: 0..3) ----------
+const W = 4, D = 4.4, H = 3, Z0 = -3, Z1 = 1.4;
+function plane(w, h, mat, pos, rotY=0, rotX=0) {
+  const m = new THREE.Mesh(new THREE.PlaneGeometry(w,h), mat);
+  m.position.set(...pos); m.rotation.set(rotX, rotY, 0); scene.add(m); return m;
+}
+plane(W, D, floorMat, [0, 0, (Z0+Z1)/2], 0, -Math.PI/2);
+plane(W, D, ceilMat,  [0, H, (Z0+Z1)/2], 0,  Math.PI/2);
+plane(W, H, wallMat,  [0, H/2, Z0]);                    // back
+plane(D, H, wallMat,  [-W/2, H/2, (Z0+Z1)/2],  Math.PI/2); // left
+plane(D, H, wallMat,  [ W/2, H/2, (Z0+Z1)/2], -Math.PI/2); // right
+
+// Front: iron bars
+const ironMat = new THREE.MeshStandardMaterial({ color:0x2b2622, metalness:.8, roughness:.55 });
+for (let x = -W/2 + 0.15; x <= W/2; x += 0.16) {
+  const bar = new THREE.Mesh(new THREE.CylinderGeometry(.018,.018,H,8), ironMat);
+  bar.position.set(x, H/2, Z1); scene.add(bar);
+}
+[0.15, 1.5, 2.85].forEach(y => {
+  const rail = new THREE.Mesh(new THREE.BoxGeometry(W, .04, .05), ironMat);
+  rail.position.set(0, y, Z1); scene.add(rail);
+});
+plane(8, H, new THREE.MeshBasicMaterial({ color:0x020202 }), [0, H/2, Z1+2.5], Math.PI); // dark corridor
+
+// Window high on back wall, with moonlight
+const WIN = { x:0.8, y:2.35 };
+const winGlow = plane(0.5, 0.4, new THREE.MeshBasicMaterial({ color:0x2a3a55 }), [WIN.x, WIN.y, Z0+0.005]);
+for (let i=-1; i<=1; i++) {
+  const b = new THREE.Mesh(new THREE.CylinderGeometry(.015,.015,.4,6), ironMat);
+  b.position.set(WIN.x + i*0.13, WIN.y, Z0+0.02); scene.add(b);
+}
+const moon = new THREE.SpotLight(0x7f9cd6, 6, 7, 0.45, 0.8, 1.5);
+moon.position.set(WIN.x, WIN.y, Z0+0.1); moon.target.position.set(0.2, 0, -0.6);
+scene.add(moon, moon.target);
+
+// The crescent stone (the way out), low under the window
+const crescentMat = new THREE.MeshStandardMaterial({
+  map: tex(stoneCanvas({ size:256, rows:1, cols:1, seed:5, crescent:true })),
+  roughness:.95, emissive:0x8a5a20, emissiveIntensity:0,
+});
+const crescentStone = new THREE.Mesh(new THREE.BoxGeometry(.42, .26, .1), crescentMat);
+crescentStone.position.set(WIN.x, 0.33, Z0+0.03);
+scene.add(crescentStone);
+const drainLight = new THREE.PointLight(0xffc27a, 0, 3); drainLight.position.set(WIN.x, 0.33, Z0-0.2); scene.add(drainLight);
+
+// Torch on left wall
+const torch = new THREE.Group();
+torch.position.set(-W/2 + 0.08, 1.75, -0.7);
+const handle = new THREE.Mesh(new THREE.CylinderGeometry(.025,.035,.4,8), new THREE.MeshStandardMaterial({ color:0x3b2a1a }));
+handle.rotation.z = -0.5; torch.add(handle);
+const flameMat = new THREE.MeshBasicMaterial({ color:0xffa040 });
+const flame = new THREE.Mesh(new THREE.ConeGeometry(.05,.16,10), flameMat);
+flame.position.set(.1, .22, 0); torch.add(flame);
+const torchLight = new THREE.PointLight(0xff8a3c, 5, 7, 1.6); torchLight.position.set(.25, .25, 0); torch.add(torchLight);
+scene.add(torch);
+scene.add(new THREE.AmbientLight(0x2a2220, 1.2));
+
+// Straw pile, bucket, chains
+const strawMat = new THREE.MeshStandardMaterial({ color:0x9a8040, roughness:1 });
+{ const r = rand(42);
+  for (let i=0; i<140; i++) {
+    const s = new THREE.Mesh(new THREE.CylinderGeometry(.006,.006,.25+r()*.2,3), strawMat);
+    s.position.set(1.3 + (r()-.5)*.9, .03 + r()*.12, -1.9 + (r()-.5)*1.1);
+    s.rotation.set(Math.PI/2 + (r()-.5)*.6, r()*Math.PI, (r()-.5)*.6);
+    scene.add(s);
+  } }
+const bucket = new THREE.Mesh(new THREE.CylinderGeometry(.16,.13,.3,14,1,true), new THREE.MeshStandardMaterial({ color:0x4a3826, side:THREE.DoubleSide }));
+bucket.position.set(1.6, .15, 0.6); scene.add(bucket);
+for (let i=0; i<7; i++) {
+  const link = new THREE.Mesh(new THREE.TorusGeometry(.035,.009,6,12), ironMat);
+  link.position.set(-1.98 + (i%2)*.004, 1.3 - i*.065, -2.2); link.rotation.y = (i%2) ? Math.PI/2 : 0;
+  scene.add(link);
+}
+
+// ---------- Aldous ----------
+const aldous = new THREE.Group();
+aldous.position.set(-0.6, 0, -2.45);
+aldous.rotation.y = 0.25;
+scene.add(aldous);
+const robeMat = new THREE.MeshStandardMaterial({ color:0x4a3f33, roughness:1 });
+const skinMat = new THREE.MeshStandardMaterial({ color:0xb08a70, roughness:.85 });
+const hairMat = new THREE.MeshStandardMaterial({ color:0xd8d2c8, roughness:1 });
+const woodMat = new THREE.MeshStandardMaterial({ color:0x3a2a1c, roughness:1 });
+
+const bench = new THREE.Mesh(new THREE.BoxGeometry(1.1,.42,.42), woodMat); bench.position.set(0,.21,-.15); aldous.add(bench);
+const torso = new THREE.Mesh(new THREE.CylinderGeometry(.17,.27,.62,14), robeMat); torso.position.set(0,.74,-.12); torso.rotation.x = 0.18; aldous.add(torso);
+const thighL = new THREE.Mesh(new THREE.BoxGeometry(.15,.13,.42), robeMat); thighL.position.set(-.1,.48,.1); aldous.add(thighL);
+const thighR = thighL.clone(); thighR.position.x = .1; aldous.add(thighR);
+const shinL = new THREE.Mesh(new THREE.BoxGeometry(.12,.44,.13), robeMat); shinL.position.set(-.1,.24,.3); aldous.add(shinL);
+const shinR = shinL.clone(); shinR.position.x = .1; aldous.add(shinR);
+for (const x of [-.2,.2]) {
+  const arm = new THREE.Mesh(new THREE.CylinderGeometry(.045,.055,.48,8), robeMat);
+  arm.position.set(x, .7, .05); arm.rotation.x = -0.9; arm.rotation.z = x>0 ? 0.15 : -0.15; aldous.add(arm);
+  const hand = new THREE.Mesh(new THREE.SphereGeometry(.045,10,8), skinMat); hand.position.set(x*.85,.55,.24); aldous.add(hand);
+}
+const headPivot = new THREE.Group(); headPivot.position.set(0,1.08,-.02); aldous.add(headPivot);
+const head = new THREE.Mesh(new THREE.SphereGeometry(.115,20,16), skinMat); head.scale.set(1,1.12,1.02); headPivot.add(head);
+const hood = new THREE.Mesh(new THREE.SphereGeometry(.14,20,16,0,Math.PI*2,0,Math.PI*0.62), robeMat);
+hood.position.set(0,.025,-.025); hood.rotation.x = -0.35; headPivot.add(hood);
+const brow = new THREE.Mesh(new THREE.BoxGeometry(.13,.018,.03), hairMat); brow.position.set(0,.04,.1); headPivot.add(brow);
+for (const x of [-.04,.04]) {
+  const eye = new THREE.Mesh(new THREE.SphereGeometry(.013,8,6), new THREE.MeshBasicMaterial({ color:0x120d08 }));
+  eye.position.set(x,.015,.105); headPivot.add(eye);
+}
+const nose = new THREE.Mesh(new THREE.ConeGeometry(.02,.06,8), skinMat); nose.position.set(0,-.01,.12); nose.rotation.x = Math.PI/2.4; headPivot.add(nose);
+const moustache = new THREE.Mesh(new THREE.BoxGeometry(.09,.02,.03), hairMat); moustache.position.set(0,-.045,.105); headPivot.add(moustache);
+const jaw = new THREE.Group(); jaw.position.set(0,-.06,.07); headPivot.add(jaw);   // beard moves when he talks
+const beard = new THREE.Mesh(new THREE.ConeGeometry(.085,.3,12), hairMat); beard.position.set(0,-.13,.02); beard.rotation.x = Math.PI + 0.25; jaw.add(beard);
+
+// His candle: its flame grows as he comes to trust you
+const candle = new THREE.Group(); candle.position.set(-.05,0,.55); aldous.add(candle);
+const wax = new THREE.Mesh(new THREE.CylinderGeometry(.025,.028,.12,10), new THREE.MeshStandardMaterial({ color:0xe8dcc0 }));
+wax.position.y = .06; candle.add(wax);
+const candleFlame = new THREE.Mesh(new THREE.SphereGeometry(.014,8,8), new THREE.MeshBasicMaterial({ color:0xffd27a }));
+candleFlame.position.y = .14; candle.add(candleFlame);
+const candleLight = new THREE.PointLight(0xffb560, 0.3, 3, 1.5); candleLight.position.y = .2; candle.add(candleLight);
+
+// ---------- Subtitle panel ----------
+const subCanvas = document.createElement("canvas"); subCanvas.width = 1024; subCanvas.height = 300;
+const subCtx = subCanvas.getContext("2d");
+const subTex = new THREE.CanvasTexture(subCanvas); subTex.colorSpace = THREE.SRGBColorSpace;
+const subPanel = new THREE.Mesh(new THREE.PlaneGeometry(1.5, 0.44), new THREE.MeshBasicMaterial({ map:subTex, transparent:true, depthWrite:false }));
+subPanel.position.set(-0.3, 1.75, -1.5);
+scene.add(subPanel);
+let subtitle = { who:"", text:"", status:"" };
+function drawSub() {
+  const g = subCtx, w = subCanvas.width, h = subCanvas.height;
+  g.clearRect(0,0,w,h);
+  if (!subtitle.text && !subtitle.status) { subTex.needsUpdate = true; return; }
+  g.fillStyle = "rgba(8,6,4,0.72)";
+  g.beginPath(); g.roundRect(8,8,w-16,h-16,22); g.fill();
+  g.textAlign = "center";
+  if (subtitle.status) { g.fillStyle = "#e9b46a"; g.font = "italic 30px Georgia"; g.fillText(subtitle.status, w/2, 52); }
+  g.fillStyle = subtitle.who === "you" ? "#bcd0e8" : "#f3e9d8";
+  g.font = "36px Georgia";
+  const words = (subtitle.who === "you" ? "You: " : "") + subtitle.text;
+  const lines = []; let line = "";
+  for (const word of words.split(/\s+/)) {
+    const t = line ? line + " " + word : word;
+    if (g.measureText(t).width > w - 80) { lines.push(line); line = word; } else line = t;
+  }
+  if (line) lines.push(line);
+  const shown = lines.slice(-5);  // long stories: show the latest lines
+  const top = subtitle.status ? 100 : 70, lh = 42;
+  shown.forEach((l,i) => g.fillText(l, w/2, top + i*lh + (5-shown.length)*lh/2));
+  subTex.needsUpdate = true;
+}
+function setSub(patch) { Object.assign(subtitle, patch); drawSub(); }
+
+// ================= Audio (his voice, from his head) =================
+const listener = new THREE.AudioListener(); camera.add(listener);
+const voice = new THREE.PositionalAudio(listener);
+voice.setRefDistance(1.2); voice.setRolloffFactor(0.8);
+headPivot.add(voice);
+const analyser = new THREE.AudioAnalyser(voice, 64);
+let synthTalking = false;
+
+function b64ToArrayBuffer(b64) { const bin = atob(b64); const u = new Uint8Array(bin.length); for (let i=0;i<bin.length;i++) u[i]=bin.charCodeAt(i); return u.buffer; }
+
+async function say(text) {
+  stopVoice();
+  state.speaking = true;
+  try {
+    if (state.cfg.tts) {
+      const { audio } = await api("speak", { text });
+      const buf = await listener.context.decodeAudioData(b64ToArrayBuffer(audio));
+      await new Promise(res => {
+        voice.setBuffer(buf); voice.onEnded = () => { voice.isPlaying = false; res(); }; voice.play();
+      });
+    } else if ("speechSynthesis" in window) {
+      await new Promise(res => {
+        const u = new SpeechSynthesisUtterance(text);
+        u.rate = 0.82; u.pitch = 0.55;
+        const v = speechSynthesis.getVoices().find(v => /en-GB/i.test(v.lang) && /male|daniel|george|arthur/i.test(v.name))
+               || speechSynthesis.getVoices().find(v => /^en/i.test(v.lang));
+        if (v) u.voice = v;
+        synthTalking = true; u.onend = u.onerror = () => { synthTalking = false; res(); };
+        speechSynthesis.speak(u);
+      });
+    }
+  } catch (e) { setSub({ status:`(voice failed: ${e.message})` }); }
+  state.speaking = false;
+}
+function stopVoice() {
+  if (voice.isPlaying) voice.stop();
+  if ("speechSynthesis" in window) speechSynthesis.cancel();
+  synthTalking = false; state.speaking = false;
+}
+
+// ================= Listening (your voice) =================
+let mediaStream = null, recorder = null, chunks = [], recStart = 0, recognition = null;
+const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
+
+async function ensureMic() {
+  if (mediaStream) return mediaStream;
+  mediaStream = await navigator.mediaDevices.getUserMedia({ audio:{ echoCancellation:true, noiseSuppression:true } });
+  return mediaStream;
+}
+function pickMime() {
+  for (const m of ["audio/webm;codecs=opus","audio/webm","audio/mp4","audio/ogg"]) if (window.MediaRecorder?.isTypeSupported?.(m)) return m;
+  return "";
+}
+
+async function startTalk() {
+  if (state.escaped || state.recording || state.busy) return;
+  if (state.speaking) stopVoice();          // you can interrupt him
+  state.recording = true; talkBtn.classList.add("on");
+  setSub({ status:"Listening…" });
+  if (state.cfg.stt) {
+    try {
+      const stream = await ensureMic();
+      if (!state.recording) return;         // released before mic was ready
+      const mime = pickMime();
+      recorder = new MediaRecorder(stream, mime ? { mimeType:mime } : undefined);
+      chunks = []; recStart = performance.now();
+      recorder.ondataavailable = e => e.data.size && chunks.push(e.data);
+      recorder.start();
+    } catch (e) { state.recording = false; talkBtn.classList.remove("on"); setSub({ status:`(microphone: ${e.message})` }); }
+  } else if (SR) {
+    recognition = new SR(); recognition.lang = "en-GB"; recognition.interimResults = false;
+    recognition._text = "";
+    recognition.onresult = e => { recognition._text = [...e.results].map(r => r[0].transcript).join(" "); };
+    recognition.start();
+  } else {
+    state.recording = false; talkBtn.classList.remove("on");
+    setSub({ status:"No voice input here. Type instead." });
+  }
+}
+
+async function stopTalk() {
+  if (!state.recording) return;
+  state.recording = false; talkBtn.classList.remove("on");
+  if (recorder) {
+    const rec = recorder; recorder = null;
+    const dur = performance.now() - recStart;
+    const done = new Promise(res => rec.onstop = res);
+    rec.stop(); await done;
+    if (dur < 400) { setSub({ status:"" }); return; }
+    const blob = new Blob(chunks, { type: rec.mimeType || "audio/webm" });
+    state.busy = true; setSub({ status:"…" });
+    try {
+      const b64 = await new Promise(res => { const fr = new FileReader(); fr.onload = () => res(fr.result.split(",")[1]); fr.readAsDataURL(blob); });
+      const { text } = await api("listen", { audio:b64, mime:blob.type });
+      state.busy = false;
+      if (!text) { setSub({ status:"He didn't catch that." }); return; }
+      await turn(text);
+    } catch (e) { state.busy = false; setSub({ status:`(${e.message})` }); }
+  } else if (recognition) {
+    const r = recognition; recognition = null;
+    await new Promise(res => { r.onend = res; r.stop(); setTimeout(res, 1500); });
+    if (r._text.trim()) await turn(r._text.trim()); else setSub({ status:"He didn't catch that." });
+  }
+}
+
+// ================= A conversation turn =================
+async function turn(text) {
+  if (state.busy || state.escaped) return;
+  state.busy = true;
+  setSub({ who:"you", text, status:"He's thinking…" });
+  state.history.push({ role:"user", content:text });
+  try {
+    const out = await api("think", { history: state.history, trust: state.trust });
+    state.trust = Math.max(0, Math.min(100, state.trust + out.trust_delta));
+    state.history.push({ role:"assistant", content: out.reply });
+    if (out.revealed_escape) state.revealed = true;
+    updateDebug(out.trust_delta);
+    state.busy = false;
+    setSub({ who:"aldous", text: out.reply, status:"" });
+    await say(out.reply);
+  } catch (e) {
+    state.history.pop();
+    state.busy = false;
+    setSub({ status:`(${e.message})` });
+  }
+}
+
+async function escape() {
+  if (state.escaped) return;
+  state.escaped = true;
+  stopVoice();
+  setSub({ who:"aldous", text: FAREWELL, status:"The stone grinds inward…" });
+  await say(FAREWELL);
+  setSub({ who:"", text:"You crawl into the old drain. Behind you, an old man hums a song about a bell. You escaped.", status:"THE END" });
+}
+
+// ================= Controls =================
+const talkBtn = document.getElementById("talkBtn");
+const sayInput = document.getElementById("say");
+talkBtn.addEventListener("pointerdown", e => { e.preventDefault(); startTalk(); });
+addEventListener("pointerup", () => state.recording && stopTalk());
+sayInput.addEventListener("keydown", e => {
+  if (e.key === "Enter" && sayInput.value.trim()) { const t = sayInput.value.trim(); sayInput.value = ""; turn(t); }
+});
+addEventListener("keydown", e => {
+  if (document.activeElement === sayInput) return;
+  if (e.code === "Space" && !e.repeat) { e.preventDefault(); startTalk(); }
+  if (e.key === "t" || e.key === "T") debugEl.style.display = debugEl.style.display === "block" ? "none" : "block";
+});
+addEventListener("keyup", e => { if (e.code === "Space" && document.activeElement !== sayInput) stopTalk(); });
+
+// Desktop look-around by dragging, click the stone
+let yaw = 0.15, pitch = -0.08, dragging = false, moved = 0, lastX = 0, lastY = 0;
+const raycaster = new THREE.Raycaster();
+renderer.domElement.addEventListener("pointerdown", e => { dragging = true; moved = 0; lastX = e.clientX; lastY = e.clientY; });
+addEventListener("pointermove", e => {
+  if (!dragging) return;
+  moved += Math.abs(e.clientX-lastX) + Math.abs(e.clientY-lastY);
+  yaw += (e.clientX-lastX) * 0.004; pitch += (e.clientY-lastY) * 0.004;
+  pitch = Math.max(-1.2, Math.min(1.2, pitch)); lastX = e.clientX; lastY = e.clientY;
+});
+renderer.domElement.addEventListener("pointerup", e => {
+  dragging = false;
+  if (moved < 6 && state.revealed) {
+    raycaster.setFromCamera(new THREE.Vector2((e.clientX/innerWidth)*2-1, -(e.clientY/innerHeight)*2+1), camera);
+    if (raycaster.intersectObject(crescentStone).length) escape();
+  }
+});
+addEventListener("pointerup", () => dragging = false);
+
+// VR controllers: hold trigger to speak, or point at the crescent stone and pull
+const tmpMat = new THREE.Matrix4();
+for (let i=0; i<2; i++) {
+  const ctrl = renderer.xr.getController(i);
+  const ray = new THREE.Line(new THREE.BufferGeometry().setFromPoints([new THREE.Vector3(), new THREE.Vector3(0,0,-1)]),
+                             new THREE.LineBasicMaterial({ color:0xe9b46a, transparent:true, opacity:.35 }));
+  ray.scale.z = 3; ctrl.add(ray);
+  ctrl.addEventListener("selectstart", () => {
+    if (state.revealed) {
+      tmpMat.identity().extractRotation(ctrl.matrixWorld);
+      raycaster.ray.origin.setFromMatrixPosition(ctrl.matrixWorld);
+      raycaster.ray.direction.set(0,0,-1).applyMatrix4(tmpMat);
+      if (raycaster.intersectObject(crescentStone).length) { escape(); return; }
+    }
+    ctrl.userData.talking = true; startTalk();
+  });
+  ctrl.addEventListener("selectend", () => { if (ctrl.userData.talking) { ctrl.userData.talking = false; stopTalk(); } });
+  scene.add(ctrl);
+}
+
+// ================= Debug =================
+const debugEl = document.getElementById("debug");
+if (new URLSearchParams(location.search).has("debug")) debugEl.style.display = "block";
+function stageName(t) { return t >= 75 ? "trusting" : t >= 50 ? "storyteller" : t >= 25 ? "grudging" : "hopeless"; }
+function updateDebug(delta=0) {
+  debugEl.textContent = `trust ${state.trust} (${delta>=0?"+":""}${delta}) · ${stageName(state.trust)}${state.revealed ? " · SECRET TOLD" : ""}`;
+}
+updateDebug();
+
+// ================= Loop =================
+const clock = new THREE.Clock();
+const headTarget = new THREE.Vector3(), localTarget = new THREE.Vector3();
+let candleLevel = 0.3;
+renderer.setAnimationLoop(() => {
+  const dt = Math.min(clock.getDelta(), 0.1), t = clock.elapsedTime;
+
+  if (!renderer.xr.isPresenting) camera.rotation.set(-pitch, -yaw, 0, "YXZ");
+
+  // Fire flicker
+  const f = 0.85 + Math.sin(t*13)*.06 + Math.sin(t*7.3)*.05 + Math.random()*.06;
+  torchLight.intensity = 5 * f; flame.scale.set(1, f*1.1, 1);
+
+  // Candle grows with trust
+  const target = 0.25 + (state.trust/100) * 1.6;
+  candleLevel += (target - candleLevel) * Math.min(1, dt*1.5);
+  candleLight.intensity = candleLevel * (0.9 + Math.random()*.15);
+  candleFlame.scale.setScalar(0.7 + candleLevel*0.6);
+
+  // Breathing and slump: he sits straighter as trust grows
+  const slump = 0.35 * (1 - state.trust/100);
+  torso.rotation.x = 0.18 + slump*0.4 + Math.sin(t*1.1)*0.015;
+  torso.scale.y = 1 + Math.sin(t*1.1)*0.012;
+
+  // Head: looks down when hopeless, looks at you as trust grows, and always while talking
+  const engaged = state.speaking || state.busy || state.recording ? 1 : Math.min(1, state.trust/40);
+  camera.getWorldPosition(headTarget);
+  aldous.worldToLocal(localTarget.copy(headTarget));
+  const dx = localTarget.x - headPivot.position.x, dy = localTarget.y - headPivot.position.y, dz = localTarget.z - headPivot.position.z;
+  const wantYaw = Math.atan2(dx, dz) * engaged;
+  const wantPitch = (-Math.atan2(dy, Math.hypot(dx,dz))) * engaged + (1-engaged) * 0.45;
+  headPivot.rotation.y += (Math.max(-1, Math.min(1, wantYaw)) - headPivot.rotation.y) * Math.min(1, dt*3);
+  headPivot.rotation.x += (Math.max(-0.5, Math.min(0.6, wantPitch)) - headPivot.rotation.x) * Math.min(1, dt*3);
+
+  // Mouth/beard moves with his voice
+  let amp = 0;
+  if (voice.isPlaying) amp = Math.min(1, analyser.getAverageFrequency() / 60);
+  else if (synthTalking) amp = 0.5 + 0.5*Math.sin(t*18);
+  jaw.rotation.x += (amp*0.25 - jaw.rotation.x) * Math.min(1, dt*20);
+
+  // Secret stone glows faintly once he's told you
+  if (state.revealed && !state.escaped) crescentMat.emissiveIntensity = 0.12 + 0.1*Math.sin(t*2.5);
+  if (state.escaped) {
+    crescentStone.position.z += (Z0 - 0.3 - crescentStone.position.z) * Math.min(1, dt*0.8);
+    drainLight.intensity += (2.5 - drainLight.intensity) * Math.min(1, dt);
+    crescentMat.emissiveIntensity = 0;
+  }
+
+  // Subtitles always face you
+  subPanel.lookAt(headTarget.x, subPanel.position.y, headTarget.z);
+
+  renderer.render(scene, camera);
+});
+
+addEventListener("resize", () => {
+  camera.aspect = innerWidth/innerHeight; camera.updateProjectionMatrix();
+  renderer.setSize(innerWidth, innerHeight);
+});
+
+// ================= Start =================
+const startBtn = document.getElementById("startBtn");
+const passWrap = document.getElementById("passWrap");
+const passInput = document.getElementById("pass");
+const cfgNote = document.getElementById("cfgNote");
+
+(async () => {
+  try {
+    state.cfg = await api("config");
+  } catch {
+    cfgNote.textContent = "Server not reachable. Running locally? Text only, no Aldous brain.";
+  }
+  if (state.cfg.needsPasscode) { passWrap.style.display = "block"; passInput.value = store.get("dungeon-pass") || ""; }
+  const notes = [];
+  if (!state.cfg.ready) notes.push("Claude key missing: he can't think yet.");
+  if (!state.cfg.tts) notes.push("No ElevenLabs voice set: using the browser's voice.");
+  if (!state.cfg.stt) notes.push(SR ? "Voice input via the browser." : "No voice input: type to speak.");
+  if (notes.length) cfgNote.innerHTML = notes.join("<br>");
+  startBtn.disabled = false; startBtn.textContent = "Enter the cell";
+})();
+
+startBtn.addEventListener("click", async () => {
+  state.pass = passInput.value.trim();
+  if (state.cfg.needsPasscode) store.set("dungeon-pass", state.pass);
+  await listener.context.resume();
+  if (state.cfg.stt) { try { await ensureMic(); } catch { cfgNote.textContent = "Microphone blocked. You can still type."; } }
+  document.getElementById("overlay").style.display = "none";
+  document.getElementById("hud").style.display = "block";
+  document.getElementById("hint").style.display = "block";
+  if (navigator.xr) document.body.appendChild(VRButton.createButton(renderer));
+  setTimeout(async () => {
+    setSub({ who:"aldous", text: INTRO, status:"" });
+    await say(INTRO);
+  }, 1200);
+});
+</script>
+</body>
+</html>
